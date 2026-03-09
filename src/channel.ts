@@ -2,7 +2,6 @@ import axios from 'axios';
 import https from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
-  DEFAULT_ACCOUNT_ID,
   createReplyPrefixContext,
   registerPluginHttpRoute,
 } from 'openclaw/plugin-sdk';
@@ -15,13 +14,14 @@ import type {
 import { getRuntime } from './runtime';
 import { dingtalkSign } from './sign';
 import type {
+  DingTalkAccountConfig,
   DingTalkConfig,
   DingTalkInboundMessage,
   DingTalkRichTextNode,
   ResolvedDingTalkAccount,
 } from './types';
 
-const DEFAULT_WEBHOOK_PATH = '/dingtalk-channel/message';
+const DEFAULT_WEBHOOK_PATH_PREFIX = '/dingtalk-channel';
 const CHANNEL_ID = 'dingtalk';
 const DEFAULT_OUTBOUND_TITLE = '[新的消息]';
 const OUTBOUND_TITLE_PREVIEW_LENGTH = 15;
@@ -31,7 +31,7 @@ const DEFAULT_BLOCK_STREAMING = true;
 const DEFAULT_TOOL_PROGRESS_MODE = 'simple';
 const TOOL_PROGRESS_THROTTLE_MS = 1500;
 const OUTBOUND_DISABLED_ERROR =
-  '[dingtalk][outbound-disabled] channels.dingtalk.accessToken is required for active outbound delivery';
+  '[dingtalk][outbound-disabled] channels.dingtalk.accounts.{accountId}.accessToken is required for active outbound delivery';
 const DINGTALK_TARGET_HINT =
   'Use "default" for robot-level outbound, or explicit target id like conversation:<id> / user:<id>.';
 
@@ -54,52 +54,91 @@ const meta: ChannelMeta = {
   order: 70,
 };
 
-function resolveDingTalkConfig(cfg: OpenClawConfig): DingTalkConfig {
+function resolveDingTalkConfig(cfg: OpenClawConfig): DingTalkConfig | undefined {
   const channelCfg = (cfg.channels as Record<string, unknown> | undefined)?.[
     CHANNEL_ID
-  ] as Partial<DingTalkConfig> | undefined;
+  ] as DingTalkConfig | undefined;
+  return channelCfg;
+}
+
+/**
+ * List all configured DingTalk account IDs.
+ * Returns account IDs from the accounts map.
+ */
+function listDingTalkAccountIds(cfg: OpenClawConfig): string[] {
+  const channelCfg = resolveDingTalkConfig(cfg);
+  if (!channelCfg?.accounts) {
+    return [];
+  }
+  return Object.keys(channelCfg.accounts).filter((id) => id.trim().length > 0);
+}
+
+/**
+ * Generate the default webhook path for an account.
+ * Format: /dingtalk-channel/{accountId}/message
+ */
+function generateDefaultWebhookPath(accountId: string): string {
+  return `${DEFAULT_WEBHOOK_PATH_PREFIX}/${accountId}/message`;
+}
+
+/**
+ * Resolve the webhook path for a specific account.
+ * Uses configured webhookPath if present, otherwise generates default.
+ */
+function resolveWebhookPathForAccount(
+  accountConfig: DingTalkAccountConfig | undefined,
+  accountId: string
+): string {
+  const rawPath = accountConfig?.webhookPath?.trim() ?? '';
+  if (rawPath) {
+    return rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+  }
+  return generateDefaultWebhookPath(accountId);
+}
+
+/**
+ * Resolve a DingTalk account configuration by accountId.
+ * Each account is fully self-contained.
+ */
+function resolveDingTalkAccount(
+  cfg: OpenClawConfig,
+  accountId: string
+): ResolvedDingTalkAccount | null {
+  const channelCfg = resolveDingTalkConfig(cfg);
+  if (!channelCfg?.accounts) {
+    return null;
+  }
+
+  const accountConfig = channelCfg.accounts[accountId];
+  if (!accountConfig) {
+    return null;
+  }
+
+  const channelEnabled = channelCfg.enabled !== false;
+  const accountEnabled = accountConfig.enabled !== false;
+
   const toolProgress =
-    channelCfg?.toolProgress === 'off' || channelCfg?.toolProgress === 'simple'
-      ? channelCfg.toolProgress
+    accountConfig.toolProgress === 'off' || accountConfig.toolProgress === 'simple'
+      ? accountConfig.toolProgress
       : DEFAULT_TOOL_PROGRESS_MODE;
   const toolProgressInGroup =
-    channelCfg?.toolProgressInGroup === 'off' || channelCfg?.toolProgressInGroup === 'simple'
-      ? channelCfg.toolProgressInGroup
+    accountConfig.toolProgressInGroup === 'off' || accountConfig.toolProgressInGroup === 'simple'
+      ? accountConfig.toolProgressInGroup
       : DEFAULT_TOOL_PROGRESS_MODE;
 
   return {
-    enabled: channelCfg?.enabled ?? true,
-    secretKey: typeof channelCfg?.secretKey === 'string' ? channelCfg.secretKey.trim() : '',
-    webhookPath: typeof channelCfg?.webhookPath === 'string' ? channelCfg.webhookPath.trim() : '',
-    accessToken: typeof channelCfg?.accessToken === 'string' ? channelCfg.accessToken.trim() : '',
+    accountId,
+    name: accountConfig.name?.trim() || undefined,
+    enabled: channelEnabled && accountEnabled,
+    secretKey: accountConfig.secretKey?.trim() ?? '',
+    webhookPath: resolveWebhookPathForAccount(accountConfig, accountId),
+    accessToken: accountConfig.accessToken?.trim() ?? '',
     blockStreaming:
-      typeof channelCfg?.blockStreaming === 'boolean'
-        ? channelCfg.blockStreaming
+      typeof accountConfig.blockStreaming === 'boolean'
+        ? accountConfig.blockStreaming
         : DEFAULT_BLOCK_STREAMING,
     toolProgress,
     toolProgressInGroup,
-  };
-}
-
-function resolveWebhookPath(cfg: OpenClawConfig): string {
-  const rawPath = resolveDingTalkConfig(cfg).webhookPath?.trim() ?? '';
-  if (!rawPath) {
-    return DEFAULT_WEBHOOK_PATH;
-  }
-  return rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
-}
-
-function resolveDingTalkAccount(cfg: OpenClawConfig, accountId?: string | null): ResolvedDingTalkAccount {
-  const resolvedAccountId = accountId?.trim() || DEFAULT_ACCOUNT_ID;
-  const conf = resolveDingTalkConfig(cfg);
-  return {
-    accountId: resolvedAccountId,
-    enabled: conf.enabled !== false,
-    secretKey: conf.secretKey,
-    accessToken: conf.accessToken ?? '',
-    blockStreaming: conf.blockStreaming ?? DEFAULT_BLOCK_STREAMING,
-    toolProgress: conf.toolProgress ?? DEFAULT_TOOL_PROGRESS_MODE,
-    toolProgressInGroup: conf.toolProgressInGroup ?? DEFAULT_TOOL_PROGRESS_MODE,
   };
 }
 
@@ -835,26 +874,47 @@ export const dingtalkPlugin: ChannelPlugin = {
       additionalProperties: false,
       properties: {
         enabled: { type: 'boolean' },
-        secretKey: { type: 'string' },
-        webhookPath: { type: 'string' },
-        accessToken: { type: 'string' },
-        blockStreaming: { type: 'boolean' },
-        toolProgress: { type: 'string', enum: ['off', 'simple'] },
-        toolProgressInGroup: { type: 'string', enum: ['off', 'simple'] },
+        accounts: {
+          type: 'object',
+          additionalProperties: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              name: { type: 'string' },
+              enabled: { type: 'boolean' },
+              secretKey: { type: 'string' },
+              webhookPath: { type: 'string' },
+              accessToken: { type: 'string' },
+              blockStreaming: { type: 'boolean' },
+              toolProgress: { type: 'string', enum: ['off', 'simple'] },
+              toolProgressInGroup: { type: 'string', enum: ['off', 'simple'] },
+            },
+            required: ['secretKey'],
+          },
+        },
       },
-      required: ['secretKey'],
+      required: ['accounts'],
     },
   },
   config: {
-    listAccountIds: () => [DEFAULT_ACCOUNT_ID],
-    resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) =>
-      resolveDingTalkAccount(cfg, accountId),
-    defaultAccountId: () => DEFAULT_ACCOUNT_ID,
-    isConfigured: (account: ResolvedDingTalkAccount) => Boolean(account.secretKey),
-    describeAccount: (account: ResolvedDingTalkAccount) => ({
-      accountId: account.accountId,
-      enabled: account.enabled,
-      configured: Boolean(account.secretKey),
+    listAccountIds: (cfg: OpenClawConfig) => listDingTalkAccountIds(cfg),
+    resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) => {
+      if (!accountId) {
+        return null;
+      }
+      return resolveDingTalkAccount(cfg, accountId);
+    },
+    defaultAccountId: (cfg: OpenClawConfig) => {
+      const ids = listDingTalkAccountIds(cfg);
+      return ids[0] ?? '';
+    },
+    isConfigured: (account: ResolvedDingTalkAccount | null) => Boolean(account?.secretKey),
+    describeAccount: (account: ResolvedDingTalkAccount | null) => ({
+      accountId: account?.accountId ?? '',
+      name: account?.name,
+      enabled: account?.enabled ?? false,
+      configured: Boolean(account?.secretKey),
+      webhookPath: account?.webhookPath ?? '',
     }),
   },
   outbound: {
@@ -875,9 +935,15 @@ export const dingtalkPlugin: ChannelPlugin = {
       text: string;
       accountId?: string | null;
     }) => {
+      if (!accountId) {
+        throw new Error('[dingtalk][outbound] accountId is required for sendText');
+      }
       const account = resolveDingTalkAccount(cfg, accountId);
+      if (!account) {
+        throw new Error(`[dingtalk][outbound] account "${accountId}" not found`);
+      }
       if (!account.accessToken) {
-        throw new Error(OUTBOUND_DISABLED_ERROR);
+        throw new Error(OUTBOUND_DISABLED_ERROR.replace('{accountId}', accountId));
       }
 
       await sendMarkdownByRobotAccessToken({
@@ -905,9 +971,15 @@ export const dingtalkPlugin: ChannelPlugin = {
       mediaUrl?: string;
       accountId?: string | null;
     }) => {
+      if (!accountId) {
+        throw new Error('[dingtalk][outbound] accountId is required for sendMedia');
+      }
       const account = resolveDingTalkAccount(cfg, accountId);
+      if (!account) {
+        throw new Error(`[dingtalk][outbound] account "${accountId}" not found`);
+      }
       if (!account.accessToken) {
-        throw new Error(OUTBOUND_DISABLED_ERROR);
+        throw new Error(OUTBOUND_DISABLED_ERROR.replace('{accountId}', accountId));
       }
 
       const outboundText = buildActiveOutboundText({ text, mediaUrl });
@@ -934,10 +1006,14 @@ export const dingtalkPlugin: ChannelPlugin = {
       };
     }) => {
       const account = resolveDingTalkAccount(ctx.cfg, ctx.accountId);
-      const webhookPath = resolveWebhookPath(ctx.cfg);
-      if (!account.secretKey) {
-        throw new Error('channels.dingtalk.secretKey is required');
+      if (!account) {
+        throw new Error(`channels.dingtalk.accounts.${ctx.accountId} not found`);
       }
+      if (!account.secretKey) {
+        throw new Error(`channels.dingtalk.accounts.${ctx.accountId}.secretKey is required`);
+      }
+
+      const webhookPath = account.webhookPath;
 
       const prevUnregister = routeUnregisterByAccount.get(account.accountId);
       if (prevUnregister) {
@@ -967,7 +1043,7 @@ export const dingtalkPlugin: ChannelPlugin = {
         );
       } else {
         ctx.log?.info?.(
-          `dingtalk[${account.accountId}] active outbound disabled: channels.dingtalk.accessToken is empty; if you see "Outbound not configured for channel: dingtalk", it comes from OpenClaw core routing/config rather than this plugin outbound sender.`,
+          `dingtalk[${account.accountId}] active outbound disabled: channels.dingtalk.accounts.${account.accountId}.accessToken is empty`,
         );
       }
     },

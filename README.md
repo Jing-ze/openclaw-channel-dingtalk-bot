@@ -47,7 +47,7 @@ the OpenClaw gateway to the public network.
 - **Inbound:** DingTalk `POST` callback -> OpenClaw gateway route -> message parsing/auth -> agent dispatch
 - **Reply outbound:** Inbound-triggered replies use `sessionWebhook` with DingTalk signature
 - **Active outbound:** Scheduled/active delivery uses robot API `robot/send` with `accessToken`
-- **Runtime mode:** single account (`accountId = "default"`)
+- **Runtime mode:** multi-account support (each account has its own webhook path)
 
 ## Installation
 
@@ -83,37 +83,56 @@ Configure OpenClaw in `~/.openclaw/openclaw.json`:
   "channels": {
     "dingtalk": {
       "enabled": true,
-      "secretKey": "SECxxxxxxxx",
-      "webhookPath": "/dingtalk-channel/message",
-      "accessToken": "dt_access_token_xxx",
-      "blockStreaming": true,
-      "toolProgress": "simple",
-      "toolProgressInGroup": "simple"
+      "accounts": {
+        "sales-bot": {
+          "name": "Sales Bot",
+          "secretKey": "SECxxxxxxxx",
+          "accessToken": "dt_access_token_xxx",
+          "webhookPath": "/dingtalk-channel/sales-bot/message"
+        },
+        "support-bot": {
+          "name": "Support Bot",
+          "secretKey": "SECyyyyyyyy",
+          "accessToken": "dt_access_token_yyy"
+        }
+      }
     }
   }
 }
 ```
 
+### Channel-level Options
+
+- `enabled` (optional): defaults to `true`; set to `false` to disable all accounts
+
+### Per-account Options
+
+- `name` (optional): display name for the account (used in CLI/UI lists)
 - `secretKey` (required): DingTalk bot security key (typically starts with `SEC`)
-- `enabled` (optional): defaults to `true`
-- `webhookPath` (optional): inbound callback path, defaults to `/dingtalk-channel/message`
+- `webhookPath` (optional): inbound callback path; defaults to `/dingtalk-channel/{accountId}/message`
 - `accessToken` (optional): DingTalk access token used for rich-text image download and active outbound delivery
+- `enabled` (optional): defaults to `true`; set to `false` to disable this account
 - `blockStreaming` (optional): defaults to `true`; when `true`, block replies are sent as they are generated instead of waiting for final aggregation
 - `toolProgress` (optional): `off` or `simple`, defaults to `simple`; controls tool progress hints in direct chats
 - `toolProgressInGroup` (optional): `off` or `simple`, defaults to `simple`; controls tool progress hints in group chats
 
 ## DingTalk Callback Setup
 
-In DingTalk bot settings, configure the callback URL to match `webhookPath`:
+In DingTalk bot settings, configure the callback URL for each account. Each account has its own webhook path:
+
+- If `webhookPath` is configured: use the configured path
+- If `webhookPath` is not configured: use `/dingtalk-channel/{accountId}/message`
+
+Example for an account with id `sales-bot`:
 
 ```text
-https://<your-gateway-host>/dingtalk-channel/message
+https://<your-gateway-host>/dingtalk-channel/sales-bot/message
 ```
 
-Example:
+Example with custom `webhookPath` configured:
 
 ```text
-https://your-domain.com/dingtalk-channel/message
+https://your-domain.com/my-custom-path/webhook
 ```
 
 ## Inbound Message Handling
@@ -167,7 +186,7 @@ There are two outbound paths:
 - Reply outbound (inbound-triggered): `sessionWebhook`
 - Active outbound (scheduled/manual): `POST https://oapi.dingtalk.com/robot/send`
 
-Active outbound is enabled only when `channels.dingtalk.accessToken` is configured. If not configured, active outbound is unsupported by default.
+Active outbound is enabled only when `channels.dingtalk.accounts.{accountId}.accessToken` is configured. If not configured, active outbound is unsupported for that account.
 
 For tools/manual send target:
 
@@ -282,8 +301,7 @@ For npm publishing, run `npm run build` before `npm publish`.
 ## Current Limitations
 
 - Only `text` and `richText` are handled for inbound parsing
-- Active outbound requires `channels.dingtalk.accessToken`
-- Single-account model only (`default`)
+- Active outbound requires `channels.dingtalk.accounts.{accountId}.accessToken`
 
 ## License
 
