@@ -310,8 +310,13 @@ async function sendMarkdownBySessionWebhook(params: {
   // the mention to be visible; the `at` field alone only triggers a
   // push notification but renders nothing in the chat bubble.
   const atNicknames = (mention?.atNicknames ?? []).filter((n) => n.trim().length > 0);
+  // Skip adding @mention prefix if the response already starts with one
+  // to avoid duplicate @mentions (e.g., when AI already includes @nickname in response)
+  const responseStartsWithMention = atNicknames.some((n) => text.trim().startsWith(`@${n}`));
   const mentionPrefix =
-    atNicknames.length > 0 ? atNicknames.map((n) => `@${n}`).join(' ') + '\n\n' : '';
+    !responseStartsWithMention && atNicknames.length > 0
+      ? atNicknames.map((n) => `@${n}`).join(' ') + '\n\n'
+      : '';
   const bodyText = `${mentionPrefix}${text}`;
   const title = buildOutboundTitle(text);
 
@@ -759,8 +764,9 @@ async function handleInboundMessage(params: {
         }
 
         const chunks = runtime.channel.text.chunkTextWithMode(text, textChunkLimit, chunkMode);
-        for (const chunk of chunks) {
-          await sendSessionText(chunk);
+        // Only add @mention to the first chunk to avoid duplicate mentions
+        for (let i = 0; i < chunks.length; i++) {
+          await sendSessionText(chunks[i], { mention: i === 0 });
         }
       },
       onError: (err: unknown, info: { kind?: string }) => {
