@@ -1,4 +1,5 @@
 import axios from 'axios';
+import https from 'node:https';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DEFAULT_ACCOUNT_ID,
@@ -38,6 +39,8 @@ const routeUnregisterByAccount = new Map<string, () => void>();
 
 interface DingTalkMentionPayload {
   atUserIds: string[];
+  /** Nicknames to render as visible @mentions inside markdown body. */
+  atNicknames?: string[];
 }
 
 const meta: ChannelMeta = {
@@ -213,6 +216,39 @@ function buildActiveOutboundText(params: { text?: string; mediaUrl?: string }): 
   return DEFAULT_OUTBOUND_TITLE;
 }
 
+const dingtalkAgent = new https.Agent({ keepAlive: true, family: 4 });
+
+function nativeHttpsPost(url: string, body: Record<string, unknown>): Promise<{ errcode?: number; errmsg?: string }> {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const parsed = new URL(url);
+    const req = https.request(
+      {
+        hostname: parsed.hostname,
+        port: 443,
+        path: parsed.pathname + parsed.search,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+        agent: dingtalkAgent,
+      },
+      (res) => {
+        let raw = '';
+        res.on('data', (chunk: Buffer) => (raw += chunk.toString()));
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(raw));
+          } catch {
+            reject(new Error(`DingTalk API non-JSON response (${res.statusCode}): ${raw.slice(0, 300)}`));
+          }
+        });
+      },
+    );
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
 async function sendMarkdownBySessionWebhook(params: {
   sessionWebhook: string;
   secretKey: string;
@@ -230,22 +266,24 @@ async function sendMarkdownBySessionWebhook(params: {
         .filter((item) => item.length > 0),
     ),
   );
+
+  // DingTalk markdown messages require @nickname text in the body for
+  // the mention to be visible; the `at` field alone only triggers a
+  // push notification but renders nothing in the chat bubble.
+  const atNicknames = (mention?.atNicknames ?? []).filter((n) => n.trim().length > 0);
+  const mentionPrefix =
+    atNicknames.length > 0 ? atNicknames.map((n) => `@${n}`).join(' ') + '\n\n' : '';
+  const bodyText = `${mentionPrefix}${text}`;
   const title = buildOutboundTitle(text);
 
-  const response = await axios.post(
-    signedUrl,
-    {
-      msgtype: 'markdown',
-      markdown: { title, text },
-      at: { atMobiles: [], atUserIds, isAtAll: false },
-    },
-    {
-      headers: { 'Content-Type': 'application/json' },
-    },
-  );
+  const result = await nativeHttpsPost(signedUrl, {
+    msgtype: 'markdown',
+    markdown: { title, text: bodyText },
+    at: { atMobiles: [], atUserIds, isAtAll: false },
+  });
 
-  if (response.data?.errcode !== 0) {
-    throw new Error(`DingTalk send failed: ${response.data?.errmsg ?? 'unknown error'}`);
+  if (result?.errcode !== 0) {
+    throw new Error(`DingTalk send failed: ${result?.errmsg ?? 'unknown error'}`);
   }
 }
 
@@ -261,20 +299,14 @@ async function sendMarkdownByRobotAccessToken(params: {
     `&timestamp=${timestamp}&sign=${sign}`;
   const title = buildOutboundTitle(text);
 
-  const response = await axios.post(
-    signedUrl,
-    {
-      msgtype: 'markdown',
-      markdown: { title, text },
-      at: { atMobiles: [], atUserIds: [], isAtAll: false },
-    },
-    {
-      headers: { 'Content-Type': 'application/json' },
-    },
-  );
+  const result = await nativeHttpsPost(signedUrl, {
+    msgtype: 'markdown',
+    markdown: { title, text },
+    at: { atMobiles: [], atUserIds: [], isAtAll: false },
+  });
 
-  if (response.data?.errcode !== 0) {
-    throw new Error(`DingTalk robot send failed: ${response.data?.errmsg ?? 'unknown error'}`);
+  if (result?.errcode !== 0) {
+    throw new Error(`DingTalk robot send failed: ${result?.errmsg ?? 'unknown error'}`);
   }
 }
 
@@ -561,6 +593,8 @@ async function handleInboundMessage(params: {
         .filter((item) => item.length > 0),
     ),
   );
+  // Collect sender nickname so @mention text renders inside markdown replies.
+  const mentionCandidateNicknames: string[] = payload.senderNick ? [payload.senderNick] : [];
 
   const mentioned =
     !isGroup ||
@@ -641,7 +675,7 @@ async function handleInboundMessage(params: {
       text: trimmed,
       mention:
         options?.mention !== false && mentionCandidateIds.length > 0
-          ? { atUserIds: mentionCandidateIds }
+          ? { atUserIds: mentionCandidateIds, atNicknames: mentionCandidateNicknames }
           : undefined,
     });
   };
